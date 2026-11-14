@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import i18n from "i18next";
 
-import type { CheckOutcome, ConfigHost, CiResult, ProjectCi, ConnectionResult, SiteStatus, Deploy, LastDeploy, Customer, EntityKind, Project, Server, Snapshot, TerminalApp } from "@/types";
+import type { CheckOutcome, ConfigHost, CiResult, ProjectCi, ConnectionResult, SiteStatus, LogStatus, Deploy, LastDeploy, Customer, EntityKind, Project, Server, Snapshot, TerminalApp } from "@/types";
 
 // Im Browser (npm run dev ohne Tauri) landen die Daten im localStorage,
 // damit sich die Oberfläche auch ohne Rust-Backend ausprobieren lässt.
@@ -187,6 +187,31 @@ export async function followLog(
     throw e;
   }
   return { streamId, stop: () => void invoke("stop_log", { streamId }) };
+}
+
+/** Empties a log file on the server; the counts are updated afterwards */
+export async function clearLog(projectId: string, file: string): Promise<void> {
+  if (!isTauri()) throw new Error(i18n.t("api.logsBrowserOnly"));
+  await invoke("clear_log", { projectId, file });
+}
+
+/** Latest error and warning counts of all projects' log files */
+export async function logOverview(): Promise<LogStatus[]> {
+  if (!isTauri()) return [];
+  return invoke<LogStatus[]>("log_overview");
+}
+
+/** Subscribes to new log counts; returns a function to unsubscribe */
+export async function onLogUpdate(handler: (overview: LogStatus[]) => void): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<LogStatus[]>("log-update", (e) => handler(e.payload));
+}
+
+/** Counts errors and warnings in the project's log files right away */
+export async function checkLogs(projectId: string): Promise<LogStatus> {
+  if (!isTauri()) throw new Error(i18n.t("api.logsBrowserOnly"));
+  return invoke<LogStatus>("check_logs", { projectId });
 }
 
 export async function listDeploys(projectId: string): Promise<Deploy[]> {

@@ -214,3 +214,18 @@ export interface SiteStatus {
   http?: { status: number; millis: number } | null;
   error?: string | null;
 }
+
+/** Error and warning entries in a whole log file, counted in the background */
+export interface LogFileCount {
+  file: string;
+  errors: number;
+  warnings: number;
+}
+
+export interface LogStatus {
+  projectId: string;
+  /** Unix milliseconds */
+  checkedAt: number;
+  /** Readable log files; missing ones are left out */
+  files: LogFileCount[];
+}

@@ -1,17 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FileText, Pause, Pencil, Play, RefreshCw, Search } from "lucide-react";
+import { Bug, Eraser, FileText, Pause, Pencil, Play, RefreshCw, Search, TriangleAlert } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { followLog, readLog } from "@/lib/api";
+import { useLogStatus } from "@/hooks/use-log-status";
+import { checkLogs, clearLog, followLog, readLog } from "@/lib/api";
 import { matches, parseLog, suggestedLogPaths, type LevelFilter, type LogLevel } from "@/lib/log-parse";
 import { cn } from "@/lib/utils";
-import type { Project, Server } from "@/types";
+import type { LogFileCount, Project, Server } from "@/types";
 
 /** Lines loaded when a file is opened */
 const INITIAL_LINES = 500;
@@ -23,6 +34,53 @@ const levelClass: Record<LogLevel, string> = {
   warning: "text-amber-300",
   info: "",
 };
+
+/** "3 errors, 5 warnings"; empty when there are neither */
+function useCountSummary() {
+  const { t } = useTranslation();
+  return ({ errors, warnings }: Pick<LogFileCount, "errors" | "warnings">) =>
+    [errors > 0 && t("logs.errors", { count: errors }), warnings > 0 && t("logs.warnings", { count: warnings })]
+      .filter(Boolean)
+      .join(", ");
+}
+
+/** Sidebar indicator: red when a log of the project has errors, amber when it only has warnings */
+export function LogStatusIcon({ projectId, className }: { projectId: string; className?: string }) {
+  const { t } = useTranslation();
+  const summarize = useCountSummary();
+  const status = useLogStatus(projectId);
+  if (!status) return null;
+  const total = status.files.reduce(
+    (sum, f) => ({ errors: sum.errors + f.errors, warnings: sum.warnings + f.warnings }),
+    { errors: 0, warnings: 0 },
+  );
+  if (total.errors === 0 && total.warnings === 0) return null;
+  const Icon = total.errors > 0 ? Bug : TriangleAlert;
+  const label = t("logs.indicator", { summary: summarize(total) });
+  return (
+    <span title={label} aria-label={label} className={cn("shrink-0", className)}>
+      <Icon className={cn("size-3.5", total.errors > 0 ? "text-danger" : "text-warning")} />
+    </span>
+  );
+}
+
+/** Counts next to a file name in the viewer */
+function FileCounts({ count }: { count?: LogFileCount }) {
+  const summarize = useCountSummary();
+  if (!count || (count.errors === 0 && count.warnings === 0)) return null;
+  return (
+    <span className="flex items-center gap-1 font-sans tabular-nums" title={summarize(count)}>
+      {count.errors > 0 && (
+        <span className="bg-danger/15 text-danger rounded px-1 text-[10px] leading-4 font-medium">{count.errors}</span>
+      )}
+      {count.warnings > 0 && (
+        <span className="bg-warning/15 text-warning rounded px-1 text-[10px] leading-4 font-medium">
+          {count.warnings}
+        </span>
+      )}
+    </span>
+  );
+}
 
 interface Props {
   project: Project;
@@ -50,6 +108,9 @@ export function LogPanel({ project, server, onEditProject, onSavePaths }: Props)
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const status = useLogStatus(project.id);
   const stopRef = useRef<(() => void) | null>(null);
   const outRef = useRef<HTMLPreElement>(null);
 
@@ -81,6 +142,27 @@ export function LogPanel({ project, server, onEditProject, onSavePaths }: Props)
       setLoading(false);
     }
   }, [file, project.id, server]);
+
+  const refresh = () => {
+    load();
+    // The indicator counts the whole file; a failed count keeps the last one
+    checkLogs(project.id).catch(() => {});
+  };
+
+  const clear = async () => {
+    if (!file) return;
+    setClearing(true);
+    try {
+      await clearLog(project.id, file);
+      setLines([]);
+      toast.success(t("logs.cleared"), { description: file });
+    } catch (e) {
+      toast.error(t("logs.clearFailed"), { description: String(e) });
+    } finally {
+      setClearing(false);
+      setConfirmClear(false);
+    }
+  };
 
   // Load once per file; the log is only read when the panel is shown
   useEffect(() => {
@@ -152,12 +234,15 @@ export function LogPanel({ project, server, onEditProject, onSavePaths }: Props)
               <Button
                 size="icon-sm"
                 variant="ghost"
-                onClick={load}
+                onClick={refresh}
                 disabled={loading || following}
                 title={t("common.refresh")}
                 aria-label={t("common.refresh")}
               >
                 <RefreshCw className={cn(loading && "animate-spin")} />
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setConfirmClear(true)} disabled={clearing}>
+                <Eraser /> {t("logs.clear")}
               </Button>
               <Button size="sm" variant={following ? "secondary" : "outline"} onClick={following ? stopFollowing : follow}>
                 {following ? <Pause /> : <Play />} {following ? t("logs.stopFollowing") : t("logs.follow")}
@@ -218,6 +303,7 @@ export function LogPanel({ project, server, onEditProject, onSavePaths }: Props)
                     onClick={() => setFile(p)}
                   >
                     {p}
+                    <FileCounts count={status?.files.find((f) => f.file === p)} />
                   </Button>
                 ))}
               </div>
@@ -270,11 +356,34 @@ export function LogPanel({ project, server, onEditProject, onSavePaths }: Props)
                         ))}
                 </pre>
               )}
-              <p className="text-muted-foreground text-xs">{t("logs.readOnly", { count: INITIAL_LINES })}</p>
+              <p className="text-muted-foreground text-xs">{t("logs.footer", { count: INITIAL_LINES })}</p>
             </>
           )
         )}
       </CardContent>
+
+      <AlertDialog open={confirmClear} onOpenChange={(open) => !clearing && setConfirmClear(open)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("logs.clearTitle", { file })}</AlertDialogTitle>
+            <AlertDialogDescription>{t("logs.clearDescription")}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={clearing}>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={clearing}
+              onClick={(e) => {
+                // Stay open until the server answered
+                e.preventDefault();
+                clear();
+              }}
+            >
+              <Eraser /> {t("logs.clear")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   );
 }
