@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Import servers from `~/.ssh/config`: Hostmoor lists the hosts from your SSH config, including `Include` files and `Host *` defaults, marks servers you already have and git hosts such as github.com, and adds the ones you pick. The file is only read, never changed.
 - Jump hosts: a server can have a jump host (`ProxyJump`). Checks, deploys, logs and the terminal connect through it with `ssh -J`, and the connection help includes it in its commands.
+- Log indicator: every 30 minutes Hostmoor counts the errors and warnings in each project's whole log files (Laravel/Monolog and PHP entries) over SSH and marks projects in the sidebar, red for errors and amber for warnings only. The log viewer shows the counts next to each file.
+- Clear logs: the log viewer can empty a log file on the server after a confirmation. This is the only change the log viewer makes on the server.
 
 ## [1.2.0] - 2026-11-10
 

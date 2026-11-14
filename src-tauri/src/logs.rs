@@ -1,8 +1,9 @@
-//! Read-only log viewer: shows the end of a log file on the server and follows it live.
+//! Log viewer: shows the end of a log file on the server and follows it live.
 //!
 //! `read` returns the last lines once (`tail -n`). `follow` keeps `tail -F` running over
 //! ssh and sends new lines in batches as the event `log-lines` until `stop` is called
-//! or the view closes. Nothing on the server is ever written.
+//! or the view closes. `count` counts errors and warnings in whole files for the
+//! indicator, and `clear` empties a file; that is the only write to the server.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -44,22 +45,19 @@ struct LinesEvent<'a> {
     reason: Option<String>,
 }
 
-/// Remote command for `tail`. Relative paths start in the project folder.
-pub fn tail_command(
+/// Remote command that runs `command` with the quoted file. Relative paths start in the project folder.
+fn on_file(
     project_dir: Option<&str>,
     file: &str,
-    lines: u32,
-    follow: bool,
+    command: impl FnOnce(&str) -> String,
 ) -> Result<String, String> {
     let file = file.trim();
     if file.is_empty() {
         return Err(tr!("No log file given.", "Keine Log-Datei angegeben."));
     }
-    let lines = lines.min(MAX_LINES);
-    let flag = if follow { " -F" } else { "" };
-    let tail = format!("tail -n {lines}{flag} -- {}", ssh::quote_path(file));
+    let command = command(&ssh::quote_path(file));
     if file.starts_with('/') || file.starts_with("~/") {
-        return Ok(tail);
+        return Ok(command);
     }
     let dir = project_dir
         .map(str::trim)
@@ -70,7 +68,133 @@ pub fn tail_command(
                 "Relative Log-Pfade brauchen den Pfad des Projekts auf dem Server."
             )
         })?;
-    Ok(format!("cd {} && {tail}", ssh::quote_path(dir)))
+    Ok(format!("cd {} && {command}", ssh::quote_path(dir)))
+}
+
+/// Remote command for `tail`
+pub fn tail_command(
+    project_dir: Option<&str>,
+    file: &str,
+    lines: u32,
+    follow: bool,
+) -> Result<String, String> {
+    let lines = lines.min(MAX_LINES);
+    let flag = if follow { " -F" } else { "" };
+    on_file(project_dir, file, |f| {
+        format!("tail -n {lines}{flag} -- {f}")
+    })
+}
+
+// Entry lines as the viewer classifies them (src/lib/log-parse.ts), as POSIX extended regexes:
+// Laravel/Monolog `[2026-11-10 09:12:01] production.ERROR: …` and
+// PHP `[10-Nov-2026 09:12:01 UTC] PHP Fatal error: …`. Stack trace lines never match.
+const ERRORS: &str = r"^\[[^]]*\][[:space:]]+[[:alnum:]_-]+\.(ERROR|CRITICAL|ALERT|EMERGENCY):|^(\[[^]]*\][[:space:]]+)?PHP (Fatal error|Parse error)";
+const WARNINGS: &str = r"^\[[^]]*\][[:space:]]+[[:alnum:]_-]+\.(WARNING|NOTICE):|^(\[[^]]*\][[:space:]]+)?PHP (Warning|Notice|Deprecated)";
+
+/// Prints "errors warnings" for the file, or "-" when it is missing or unreadable
+fn count_command(project_dir: Option<&str>, file: &str) -> Result<String, String> {
+    let count = on_file(project_dir, file, |f| {
+        format!(
+            "if [ -f {f} ] && [ -r {f} ]; then echo \"$(grep -cE -e '{ERRORS}' -- {f}) $(grep -cE -e '{WARNINGS}' -- {f})\"; else echo -; fi"
+        )
+    })?;
+    Ok(format!("( {count} ) 2>/dev/null || echo -"))
+}
+
+/// Empties the file and prints "ok", or "missing" when there is no such file
+fn clear_command(project_dir: Option<&str>, file: &str) -> Result<String, String> {
+    on_file(project_dir, file, |f| {
+        format!("if [ -f {f} ]; then : > {f} && echo ok; else echo missing; fi")
+    })
+}
+
+/// Log files of a project: the saved ones, else the usual one for its stack (as in the UI)
+pub fn paths(project: &Project) -> Vec<String> {
+    let saved: Vec<String> = project
+        .log_paths
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !saved.is_empty() {
+        return saved;
+    }
+    match project.stack.as_str() {
+        "laravel" => vec!["storage/logs/laravel.log".into()],
+        "wordpress" => vec!["wp-content/debug.log".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Errors and warnings in a whole log file
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCount {
+    pub file: String,
+    pub errors: u32,
+    pub warnings: u32,
+}
+
+fn ssh_error(e: ssh::ConnectionResult) -> String {
+    e.detail.unwrap_or_else(|| {
+        tr!(
+            "The SSH connection failed.",
+            "Die SSH-Verbindung ist fehlgeschlagen."
+        )
+    })
+}
+
+/// Counts errors and warnings in all log files of the project with one ssh call.
+/// Files that don't exist or can't be read are left out.
+pub async fn count(project: &Project, server: &Server) -> Result<Vec<FileCount>, String> {
+    let files: Vec<(String, String)> = paths(project)
+        .into_iter()
+        .filter_map(|f| Some((count_command(project_dir(project), &f).ok()?, f)))
+        .collect();
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let script = files
+        .iter()
+        .map(|(cmd, _)| cmd.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let script = format!("sh -c {}", ssh::shell_quote(&script));
+    let out = ssh::run(server, &script, READ_TIMEOUT)
+        .await
+        .map_err(ssh_error)?;
+    Ok(files
+        .into_iter()
+        .zip(out.lines())
+        .filter_map(|((_, file), line)| {
+            let (errors, warnings) = line.trim().split_once(' ')?;
+            Some(FileCount {
+                file,
+                errors: errors.parse().ok()?,
+                warnings: warnings.parse().ok()?,
+            })
+        })
+        .collect())
+}
+
+/// Empties a log file on the server
+pub async fn clear(project: &Project, server: &Server, file: &str) -> Result<(), String> {
+    let cmd = format!("{} 2>&1", clear_command(project_dir(project), file)?);
+    let cmd = format!("sh -c {}", ssh::shell_quote(&cmd));
+    let out = ssh::run(server, &cmd, READ_TIMEOUT)
+        .await
+        .map_err(ssh_error)?;
+    match out.trim() {
+        "ok" => Ok(()),
+        "missing" => Err(tr!(
+            "The log file does not exist.",
+            "Die Log-Datei existiert nicht."
+        )),
+        other => Err(other.to_string()),
+    }
 }
 
 fn project_dir(project: &Project) -> Option<&str> {
@@ -87,14 +211,9 @@ pub async fn read(
     let cmd = tail_command(project_dir(project), file, lines.max(1), false)?;
     // tail's own errors (file missing, no permission) go to stderr with a non-zero code
     let cmd = format!("{cmd} 2>&1");
-    ssh::run(server, &cmd, READ_TIMEOUT).await.map_err(|e| {
-        e.detail.unwrap_or_else(|| {
-            tr!(
-                "The SSH connection failed.",
-                "Die SSH-Verbindung ist fehlgeschlagen."
-            )
-        })
-    })
+    ssh::run(server, &cmd, READ_TIMEOUT)
+        .await
+        .map_err(ssh_error)
 }
 
 /// Starts following a log file; new lines arrive as `log-lines` events with `stream_id`
@@ -245,6 +364,66 @@ mod tests {
                 .unwrap()
                 .contains("-n 5000 ")
         );
+    }
+
+    fn sh(cmd: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn counts_entries_in_a_real_shell_and_clears_the_file() {
+        let dir = std::env::temp_dir().join("hostmoor-log-count-test");
+        std::fs::create_dir_all(dir.join("storage/logs")).unwrap();
+        let log = "\
+[2026-11-10 09:12:01] production.ERROR: SQLSTATE[HY000] Connection refused {\"exception\":\"[object] (PDOException(code: 2002))
+[stacktrace]
+#0 /var/www/vendor/laravel/framework/src/Illuminate/Database/Connection.php(1): ERROR: not an entry
+\"}
+[2026-11-10 09:13:00] local.WARNING: Cache miss
+[2026-11-10 09:14:00] production.INFO: User saw a production.ERROR: page
+[2026-11-10T09:15:00.123456+01:00] production.CRITICAL: Queue down
+[2026-11-10 09:16:00] production.NOTICE: Slow query
+[10-Nov-2026 09:17:00 UTC] PHP Warning:  Undefined variable $x
+[2026-11-10 09:18:00] production.DEBUG: PHP Fatal error mentioned in a message
+";
+        std::fs::write(dir.join("storage/logs/laravel.log"), log).unwrap();
+        let file = "storage/logs/laravel.log";
+
+        let count = count_command(dir.to_str(), file).unwrap();
+        assert_eq!(sh(&count), "2 3\n");
+        let missing = count_command(dir.to_str(), "storage/logs/nope.log").unwrap();
+        assert_eq!(sh(&missing), "-\n");
+        let bad_dir = count_command(Some("/does/not/exist"), file).unwrap();
+        assert_eq!(sh(&bad_dir), "-\n");
+
+        assert_eq!(sh(&clear_command(dir.to_str(), file).unwrap()), "ok\n");
+        assert_eq!(std::fs::read(dir.join(file)).unwrap().len(), 0);
+        assert_eq!(sh(&count), "0 0\n");
+        assert_eq!(
+            sh(&clear_command(dir.to_str(), "storage/logs/nope.log").unwrap()),
+            "missing\n"
+        );
+        assert!(!dir.join("storage/logs/nope.log").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn paths_fall_back_to_the_stack_default() {
+        let mut project: Project = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "Shop", "customerId": "c", "stack": "laravel"
+        }))
+        .unwrap();
+        assert_eq!(paths(&project), ["storage/logs/laravel.log"]);
+        project.log_paths = Some(" a.log \n\n/var/log/b.log\n".into());
+        assert_eq!(paths(&project), ["a.log", "/var/log/b.log"]);
+        project.stack = "static".into();
+        project.log_paths = None;
+        assert!(paths(&project).is_empty());
     }
 
     #[test]

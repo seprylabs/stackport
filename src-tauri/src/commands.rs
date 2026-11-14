@@ -7,6 +7,7 @@ use crate::ci::{self, CiResult};
 use crate::ci_watch::{CiWatch, ProjectCi};
 use crate::db::{Db, Table};
 use crate::deploy;
+use crate::log_watch::{self, LogStatus, LogWatch};
 use crate::logs;
 use crate::models::{Backup, Customer, Deploy, LastDeploy, Project, Server, Snapshot};
 use crate::site_watch::{self, SiteStatus, SiteWatch};
@@ -71,12 +72,15 @@ pub fn save_project(
     db: State<Db>,
     watch: State<CiWatch>,
     sites: State<SiteWatch>,
+    log_watch: State<LogWatch>,
     project: Project,
 ) -> CmdResult<()> {
     db.save_project(&project).map_err(err)?;
     // Repo-URL oder Domain könnte sich geändert haben
     watch.refresh();
     sites.refresh();
+    // Server, path or stack decide which log files are counted
+    log_watch.refresh();
     Ok(())
 }
 
@@ -153,9 +157,16 @@ pub fn set_deploy_script(db: State<Db>, id: String, script: Option<String>) -> C
 
 /// Log files of a project, one per line; empty resets to the suggestion for the stack
 #[tauri::command]
-pub fn set_log_paths(db: State<Db>, id: String, paths: Option<String>) -> CmdResult<()> {
+pub fn set_log_paths(
+    db: State<Db>,
+    log_watch: State<LogWatch>,
+    id: String,
+    paths: Option<String>,
+) -> CmdResult<()> {
     let paths = paths.filter(|s| !s.trim().is_empty());
-    db.set_log_paths(&id, paths.as_deref()).map_err(err)
+    db.set_log_paths(&id, paths.as_deref()).map_err(err)?;
+    log_watch.refresh();
+    Ok(())
 }
 
 fn project_and_server(db: &Db, project_id: &str) -> CmdResult<(Project, Server)> {
@@ -204,6 +215,38 @@ pub fn follow_log(
 #[tauri::command]
 pub fn stop_log(app: AppHandle, stream_id: String) -> bool {
     logs::stop(&app, &stream_id)
+}
+
+/// Latest error and warning counts of all projects' log files
+#[tauri::command]
+pub fn log_overview(log_watch: State<LogWatch>) -> Vec<LogStatus> {
+    log_watch.overview()
+}
+
+/// Counts errors and warnings in the project's log files right away
+#[tauri::command]
+pub async fn check_logs(
+    app: AppHandle,
+    db: State<'_, Db>,
+    project_id: String,
+) -> CmdResult<LogStatus> {
+    let (project, server) = project_and_server(&db, &project_id)?;
+    log_watch::check_project(&app, &project, &server).await
+}
+
+/// Empties a log file on the server, then counts the project's logs again
+#[tauri::command]
+pub async fn clear_log(
+    app: AppHandle,
+    db: State<'_, Db>,
+    project_id: String,
+    file: String,
+) -> CmdResult<()> {
+    let (project, server) = project_and_server(&db, &project_id)?;
+    logs::clear(&project, &server, &file).await?;
+    // The file is empty either way; a failed count only leaves the indicator stale
+    let _ = log_watch::check_project(&app, &project, &server).await;
+    Ok(())
 }
 
 #[tauri::command]

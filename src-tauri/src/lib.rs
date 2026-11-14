@@ -8,6 +8,7 @@ mod ci_watch;
 mod commands;
 mod db;
 mod deploy;
+mod log_watch;
 mod logs;
 mod models;
 mod site_watch;
@@ -41,6 +42,8 @@ pub fn run() {
             ci_watch::start(app.handle().clone());
             app.manage(site_watch::SiteWatch::default());
             site_watch::start(app.handle().clone());
+            app.manage(log_watch::LogWatch::default());
+            log_watch::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -72,6 +75,9 @@ pub fn run() {
             commands::read_log,
             commands::follow_log,
             commands::stop_log,
+            commands::log_overview,
+            commands::check_logs,
+            commands::clear_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
